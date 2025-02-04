@@ -96,17 +96,18 @@ async function llm_do_initial_pass(chunks: string[], question: string, batchSize
 
 // Helper function to analyze a single chunk
 async function analyzeChunk(chunk: string, question: string, chunkIndex: number): Promise<ChunkAnalysis> {
-    const prompt = `Given this text chunk from a PDF:
+    const prompt = `You are a critical reader. Given this text chunk from a PDF:
       
 "${chunk}"
 
 And this question: "${question}"
 
-Please analyze whether this chunk contains information relevant to answering the question.
+your task is to judge whether this chunk contains information relevant to answering the question. Be very critical and only return true if you are very confident that the chunk contains relevant information
+
 Return your analysis as a JSON object with these fields:
+- summary (string): Explain why you think this chunk is relevant or not to the question in 1 or 2 sentences maximum.
 - confidence (number between 0-1): How confident are you that this chunk contains relevant information
 - save_for_later_processing (boolean): Should we use this chunk to form the final answer?
-- summary (string): Summarize this chunk in 1-2 sentences maximum
 - relevant_lines (array of numbers): Line numbers in this chunk that contain relevant information
 
 Return ONLY the JSON text, no other text such as \`\`\`json or whatever.`;
