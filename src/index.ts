@@ -8,6 +8,9 @@ const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY || '',
 });
 
+const CHUNK_ANALYZER_MODEL = "gpt-3.5-turbo";
+const QUESTION_ANSWERING_MODEL = "o1-mini";
+
 function chunkPDF(text: string, max_chunk_length: number = 500): string[] {
     // Split by multiple newlines and filter out empty chunks
     const initialChunks = text
@@ -68,13 +71,32 @@ interface ChunkAnalysis {
     chunk_index: number;
 }
 
-async function llm_do_initial_pass(chunks: string[], question: string): Promise<ChunkAnalysis[]> {
+async function llm_do_initial_pass(chunks: string[], question: string, batchSize: number = 3): Promise<ChunkAnalysis[]> {
     try {
         const analyses: ChunkAnalysis[] = [];
+        
+        // Process chunks in batches
+        for (let i = 0; i < chunks.length; i += batchSize) {
+            const batch = chunks.slice(i, i + batchSize);
+            const batchPromises = batch.map((chunk, batchIndex) => {
+                const chunkIndex = i + batchIndex;
+                return analyzeChunk(chunk, question, chunkIndex);
+            });
+            
+            // Wait for all promises in the current batch to resolve
+            const batchResults = await Promise.all(batchPromises);
+            analyses.push(...batchResults);
+        }
 
-        for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
-            const chunk = chunks[chunkIndex];
-            const prompt = `Given this text chunk from a PDF:
+        return analyses;
+    } catch (error) {
+        throw new Error(`OpenAI API error: ${error}`);
+    }
+}
+
+// Helper function to analyze a single chunk
+async function analyzeChunk(chunk: string, question: string, chunkIndex: number): Promise<ChunkAnalysis> {
+    const prompt = `Given this text chunk from a PDF:
       
 "${chunk}"
 
@@ -89,54 +111,46 @@ Return your analysis as a JSON object with these fields:
 
 Return ONLY the JSON text, no other text such as \`\`\`json or whatever.`;
 
-            let attempts = 0;
-            let analysis;
-
-            while (attempts < 3) {
-                try {
-                    const response = await openai.chat.completions.create({
-                        model: "o1-mini",
-                        messages: [
-                            {
-                                role: "user",
-                                content: prompt
-                            }
-                        ]
-                    });
-
-                    console.log(response.choices[0].message.content);
-                    analysis = JSON.parse(response.choices[0].message.content || '{}');
-                    analysis.chunk_index = chunkIndex; // Add chunk index to analysis
-                    break;
-                } catch (error) {
-                    if (error instanceof SyntaxError) {
-                        console.error('JSON parsing error:', error);
-                        attempts++;
-                        if (attempts === 3) {
-                            throw new Error('Failed to parse JSON response after 3 attempts');
-                        }
-                    } else {
-                        throw error; // Re-throw non-JSON parsing errors
+    let attempts = 0;
+    while (attempts < 3) {
+        try {
+            const response = await openai.chat.completions.create({
+                model: CHUNK_ANALYZER_MODEL,
+                messages: [
+                    {
+                        role: "user",
+                        content: prompt
                     }
+                ]
+            });
+
+            console.log(response.choices[0].message.content);
+            const analysis = JSON.parse(response.choices[0].message.content || '{}');
+            analysis.chunk_index = chunkIndex;
+            return analysis;
+        } catch (error) {
+            if (error instanceof SyntaxError) {
+                console.error('JSON parsing error:', error);
+                attempts++;
+                if (attempts === 3) {
+                    throw new Error('Failed to parse JSON response after 3 attempts');
                 }
+            } else {
+                throw error;
             }
-
-            analyses.push(analysis!);
         }
-
-        return analyses;
-    } catch (error) {
-        throw new Error(`OpenAI API error: ${error}`);
     }
+    throw new Error('Failed to analyze chunk');
 }
 
-async function llm_do_question_answer(filteredAnalysis: ChunkAnalysis[], question: string, max_characters: number): Promise<string> {
+async function llm_do_question_answer(filteredAnalysis: ChunkAnalysis[], chunks: string[], question: string, max_characters: number): Promise<string> {
     // Build context and track chunk indices
     let context = '';
     let chunkIndices: number[] = [];
     for (const analysis of filteredAnalysis) {
-        if (context.length + analysis.summary.length <= max_characters) {
-            context += analysis.summary + ' (Chunk ' + analysis.chunk_index + ')' + '\n';
+        const chunk = chunks[analysis.chunk_index];
+        if (context.length + chunk.length <= max_characters) {
+            context += `[Chunk ${analysis.chunk_index}]:\n${chunk}\n\n`;
             chunkIndices.push(analysis.chunk_index);
         } else {
             break;
@@ -160,13 +174,8 @@ The available chunk indices are: ${JSON.stringify(chunkIndices)}`;
 
     try {
         const response = await openai.chat.completions.create({
-            model: "o1-mini",
-            messages: [
-                {
-                    role: "user",
-                    content: prompt
-                }
-            ]
+            model: QUESTION_ANSWERING_MODEL,
+            messages: [{ role: "user", content: prompt }]
         });
 
         return response.choices[0].message.content || 'No answer generated';
@@ -228,14 +237,15 @@ async function main(): Promise<void> {
         
         const chunks = chunkPDF(pdfData.text);
         
-        const analysis = await llm_do_initial_pass(chunks, question);
+        // Process 5 chunks in parallel
+        const analysis = await llm_do_initial_pass(chunks, question, 5);
         const filteredAnalysis = analysis
             .filter(chunk => chunk.save_for_later_processing)
             .sort((a, b) => b.confidence - a.confidence);
         console.log('\nGPT Analysis:', JSON.stringify(filteredAnalysis, null, 2));
 
         // Add the question answering step
-        const answer = await llm_do_question_answer(filteredAnalysis, question, 2000);
+        const answer = await llm_do_question_answer(filteredAnalysis, chunks, question, 5000);
         console.log('\nAnswer:', answer);
 
         const extractedChunkIndices = extractChunkIndices(answer);
