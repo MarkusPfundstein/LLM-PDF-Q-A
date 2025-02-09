@@ -3,13 +3,26 @@ config(); // Load environment variables
 
 import { extractPDFData } from './pdf';
 import OpenAI from 'openai';
+import N3 from 'n3';
+
+const { DataFactory } = N3;
+const { namedNode, literal, quad } = DataFactory;
+
+import { VectorStore } from './vector';
+import fs from 'fs/promises';
+import { chooseNextGraphNode, extractEntities, extractRDFTriples, GraphNode, llm_do_question_answer, QAInput } from './prompts';
 
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY || '',
 });
 
-const CHUNK_ANALYZER_MODEL = "gpt-3.5-turbo";
-const QUESTION_ANSWERING_MODEL = "o1-mini";
+const rdfStore = new N3.Store();
+const vectorStore = new VectorStore();
+
+const EMBEDDING_MODEL = "text-embedding-ada-002"
+
+const VECTOR_STORE_PATH = '.vector.json';
+const RDF_STORE_PATH = '.db.rdf';
 
 function chunkPDF(text: string, max_chunk_length: number = 500): string[] {
     // Split by multiple newlines and filter out empty chunks
@@ -63,128 +76,6 @@ function chunkPDF(text: string, max_chunk_length: number = 500): string[] {
     return finalChunks;
 }
 
-interface ChunkAnalysis {
-    confidence: number;
-    save_for_later_processing: boolean;
-    summary: string;
-    relevant_lines: number[];
-    chunk_index: number;
-}
-
-async function llm_do_initial_pass(chunks: string[], question: string, batchSize: number = 3): Promise<ChunkAnalysis[]> {
-    try {
-        const analyses: ChunkAnalysis[] = [];
-        
-        // Process chunks in batches
-        for (let i = 0; i < chunks.length; i += batchSize) {
-            const batch = chunks.slice(i, i + batchSize);
-            const batchPromises = batch.map((chunk, batchIndex) => {
-                const chunkIndex = i + batchIndex;
-                return analyzeChunk(chunk, question, chunkIndex);
-            });
-            
-            // Wait for all promises in the current batch to resolve
-            const batchResults = await Promise.all(batchPromises);
-            analyses.push(...batchResults);
-        }
-
-        return analyses;
-    } catch (error) {
-        throw new Error(`OpenAI API error: ${error}`);
-    }
-}
-
-// Helper function to analyze a single chunk
-async function analyzeChunk(chunk: string, question: string, chunkIndex: number): Promise<ChunkAnalysis> {
-    const prompt = `You are a critical reader. Given this text chunk from a PDF:
-      
-"${chunk}"
-
-And this question: "${question}"
-
-your task is to judge whether this chunk contains information relevant to answering the question. Be very critical and only return true if you are very confident that the chunk contains relevant information
-
-Return your analysis as a JSON object with these fields:
-- summary (string): Explain why you think this chunk is relevant or not to the question in 1 or 2 sentences maximum.
-- confidence (number between 0-1): How confident are you that this chunk contains relevant information
-- save_for_later_processing (boolean): Should we use this chunk to form the final answer?
-- relevant_lines (array of numbers): Line numbers in this chunk that contain relevant information
-
-Return ONLY the JSON text, no other text such as \`\`\`json or whatever.`;
-
-    let attempts = 0;
-    while (attempts < 3) {
-        try {
-            const response = await openai.chat.completions.create({
-                model: CHUNK_ANALYZER_MODEL,
-                messages: [
-                    {
-                        role: "user",
-                        content: prompt
-                    }
-                ]
-            });
-
-            console.log(response.choices[0].message.content);
-            const analysis = JSON.parse(response.choices[0].message.content || '{}');
-            analysis.chunk_index = chunkIndex;
-            return analysis;
-        } catch (error) {
-            if (error instanceof SyntaxError) {
-                console.error('JSON parsing error:', error);
-                attempts++;
-                if (attempts === 3) {
-                    throw new Error('Failed to parse JSON response after 3 attempts');
-                }
-            } else {
-                throw error;
-            }
-        }
-    }
-    throw new Error('Failed to analyze chunk');
-}
-
-async function llm_do_question_answer(filteredAnalysis: ChunkAnalysis[], chunks: string[], question: string, max_characters: number): Promise<string> {
-    // Build context and track chunk indices
-    let context = '';
-    let chunkIndices: number[] = [];
-    for (const analysis of filteredAnalysis) {
-        const chunk = chunks[analysis.chunk_index];
-        if (context.length + chunk.length <= max_characters) {
-            context += `[Chunk ${analysis.chunk_index}]:\n${chunk}\n\n`;
-            chunkIndices.push(analysis.chunk_index);
-        } else {
-            break;
-        }
-    }
-
-    const prompt = `Based on these relevant excerpts from a document:
-
-${context}
-
-Please answer this question: "${question}"
-
-For each sentence in your answer, add a list of chunk indices that were used to generate that sentence. Use this format:
-[Sentence] {chunk_indices: [x,y,z]}
-
-For example:
-"The cat is black. {chunk_indices: [0,2]} It likes to play with yarn. {chunk_indices: [1]}"
-
-Provide a clear and concise answer based only on the information given in the excerpts.
-The available chunk indices are: ${JSON.stringify(chunkIndices)}`;
-
-    try {
-        const response = await openai.chat.completions.create({
-            model: QUESTION_ANSWERING_MODEL,
-            messages: [{ role: "user", content: prompt }]
-        });
-
-        return response.choices[0].message.content || 'No answer generated';
-    } catch (error) {
-        throw new Error(`OpenAI API error in question answering: ${error}`);
-    }
-}
-
 function extractChunkIndices(text: string): number[] {
     // Create a Set to store unique chunk indices
     const indices = new Set<number>();
@@ -211,56 +102,291 @@ function extractChunkIndices(text: string): number[] {
     return Array.from(indices)//.sort((a, b) => a - b);
 }
 
+async function getEmbedding(text: string): Promise<number[]> {
+    try {
+        const response = await openai.embeddings.create({
+            model: EMBEDDING_MODEL,
+            input: text,
+            encoding_format: "float"
+        });
+
+        // Return the embedding vector
+        return response.data[0].embedding;
+    } catch (error) {
+        console.error('Error getting embedding:', error);
+        throw new Error(`Failed to get embedding: ${error}`);
+    }
+}
+
+async function indexPDF(pdfPath: string, max_chunks: number = -1): Promise<boolean> {
+    const pdfData = await extractPDFData(pdfPath);
+    
+    const chunks = chunkPDF(pdfData.text);
+
+    const { DataFactory } = N3;
+    const { namedNode, literal, quad } = DataFactory;
+    
+    // Extract entities and RDF triples from each chunk
+    max_chunks = max_chunks == -1 ? chunks.length : max_chunks;
+    for (let i = 0; i < max_chunks; i++) {
+        try {
+            const chunk = chunks[i];
+            console.log(`Processing chunk ${i + 1}/${max_chunks} (of ${chunks.length})`);
+            
+            const chunkEntities = await extractEntities(chunk);
+
+            for (const entity of chunkEntities) {
+                const embedding = await getEmbedding(entity);
+
+                vectorStore.store(entity, embedding);
+
+                // need to go through all entities in the vector store and find synonyms. 
+                // we need to do this because the synonyms might not be in the same chunk
+                // and we need to find them all and add them to the RDF store
+                const similarities = vectorStore.get_most_similar(entity, embedding, 1);
+
+                // Only consider it a synonym if similarity is above a threshold
+                // Maybe use a LLM here to judge?
+                const SYNONYM_THRESHOLD = 0.95;
+                if (similarities.length > 0 && similarities[0].similarity >= SYNONYM_THRESHOLD) {
+                    const synQuad = quad(
+                        namedNode(entity), // Subject
+                        namedNode('is_synonym'), // Predicate
+                        literal(similarities[0].text, 'en'), // Object
+                        namedNode(`chunk_${i}`), // Graph
+                    );
+                    rdfStore.addQuad(synQuad);
+                }
+            }
+            
+            // extract RDF triples from chunk using entities
+            const triples = await extractRDFTriples(chunk, chunkEntities);
+
+            // Add triples to RDF store
+            for (const triple of triples) {
+                const relQuad = quad(
+                    namedNode(triple[0]), // Subject
+                    namedNode(triple[1]), // Predicate
+                    literal(triple[2], 'en'), // Object
+                    namedNode(`chunk_${i}`), // Graph
+                );
+                //console.log(`\nQuad:`, myQuad);
+                rdfStore.addQuad(relQuad);
+            }
+        } catch (error) {
+            console.error('Error processing chunk:', i, error);
+        }
+    }
+
+    return true;
+}
+
+async function queryPDF(pdfPath: string, question: string, max_similarities: number = 3): Promise<void> {
+    let depth = 0;
+
+    const strategy : 'embed_question' | 'embed_entities' = 'embed_question';
+
+    let allNodes: GraphNode[] = [];
+    if (strategy == 'embed_question') {
+        const embedding = await getEmbedding(question);
+        const similarities = vectorStore.get_most_similar(question, embedding, 10);
+
+        for (const similarity of similarities) {
+            console.log(`\nSimilarity:`, similarity.text);
+            const nodes = rdfStore.match(namedNode(similarity.text), null, null);
+            
+            for (const node of nodes) {
+                console.log(node.subject.value, node.predicate.value, node.object.value);
+                allNodes.push({
+                    "subject": node.subject.value,
+                    
+                    "predicate": node.predicate.value,
+                    "value": node.object.value,
+                    "chunk": node.graph.value
+                });
+            }
+        }
+    } else if (strategy == 'embed_entities') {
+        const entities = await extractEntities(question);
+        console.log('\nEntities:', entities);
+        for (const entity of entities) {
+
+            let embedding = vectorStore.getEmbedding(entity);
+            if (!embedding) {
+                embedding = await getEmbedding(entity);
+                vectorStore.store(entity, embedding);
+            }
+            const similarities = vectorStore.get_most_similar(question, embedding, max_similarities);
+
+            for (const similarity of similarities) {
+                console.log(`\nSimilarity:`, similarity.text);
+                const nodes = rdfStore.match(namedNode(similarity.text), null, null);
+                
+                for (const node of nodes) {
+                    console.log(node.subject.value, node.predicate.value, node.object.value);
+                    allNodes.push({
+                        "subject": node.subject.value,
+
+                        "predicate": node.predicate.value,
+                        "value": node.object.value,
+                        "chunk": node.graph.value
+                    });
+                }
+            }
+        }
+    }
+
+    const visitedNodes: GraphNode[] = [];
+    // search 3 levels deep
+    while (true) {
+        if (depth > 2) {
+            console.log('break because 3 levels reached');
+            break;
+        }
+        if (allNodes.length == 0) {
+            console.log('break because no nodes left');
+            break;
+        }
+
+        const nextNodes = await chooseNextGraphNode(allNodes, question, allNodes.length);
+        console.log('\nNext Nodes:\n', nextNodes.map(n => `${n.subject} ${n.predicate} ${n.value}\n`));
+        allNodes = [];
+        for (const node of nextNodes) {
+            console.log('\Follow node:', node);
+            const queryNodes1 = rdfStore.match(null, null, literal(node.value, "en"));
+            const queryNodes2 = rdfStore.match(namedNode(node.subject), null, null);
+            const queryNodes = [...queryNodes1, ...queryNodes2];
+            console.log('\Try visit: ', queryNodes.length);
+            const tmp: GraphNode[] = [];
+            for (const n of queryNodes) {
+                if (!visitedNodes.some(v => {
+                    return (v.subject == n.subject.value 
+                            && v.predicate == n.predicate.value
+                            && v.value == n.object.value
+                            && v.chunk == n.graph.value);
+                })) {
+                    console.log('New node:', n.subject.value, n.predicate.value, n.object.value, n.graph.value);
+                    tmp.push({
+                        "subject": n.subject.value,
+                        "predicate": n.predicate.value,
+                        "value": n.object.value,
+                        "chunk": n.graph.value
+                    });
+                    visitedNodes.push(tmp[tmp.length - 1]);
+                }
+            }
+            allNodes.push(...tmp);
+        }
+        //console.log('\nIteration', depth + 1, 'All Nodes:', allNodes);
+        console.log(`iteration: ${depth + 1} visitedNodes: ${visitedNodes.length}`);        
+        depth++;
+    }
+
+    const chunkIndices = visitedNodes.map(n => n.chunk.split('_')[1]);
+    const pdfData = await extractPDFData(pdfPath);
+    const chunks = chunkPDF(pdfData.text);
+    const qaInput: QAInput[] = chunkIndices.map(index => {
+        return {
+            chunk: chunks[parseInt(index)],
+            index: parseInt(index)
+        }
+    });
+
+    // Add the question answering step
+    const answer = await llm_do_question_answer(qaInput, question, 20000);
+    console.log('Answer:', answer);
+    const extractedChunkIndices = extractChunkIndices(answer);
+    console.log('\nExtracted Chunk Indices:', extractedChunkIndices);    
+}
+
+async function saveRDFStore(pdfPath: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+        const writer = new N3.Writer({ format: 'N-Triples' });
+        for (const match of rdfStore.match(null, null, null)) {
+            writer.addQuad(match);
+        }
+        writer.end(async (error, result) => {
+            if (error) {
+                reject(error);
+            } else {
+                await fs.writeFile(pdfPath + '.rdf', result);
+                resolve(result);
+            }
+        });
+    });
+}
+
+async function loadRDFStoreFromText(rdfText: string): Promise<void> {    
+    // Split the text into lines and filter out empty lines
+    const lines = rdfText.split('\n').filter(line => line.trim().length > 0);
+    
+    for (const line of lines) {
+        // Parse each line in format: <subject> <predicate> "object"@en <graph> .
+        const match = line.match(/<([^>]+)>\s+<([^>]+)>\s+"([^"]+)"@en\s+<([^>]+)>\s+\./);
+        
+        if (match) {
+            const [_, subject, predicate, object, graph] = match;
+            
+            const rdfQuad = quad(
+                namedNode(subject),
+                namedNode(predicate),
+                literal(object, 'en'),
+                namedNode(graph)
+            );
+            
+            rdfStore.addQuad(rdfQuad);
+        }
+    }
+}
+
+async function loadRDFStore(pdfPath: string): Promise<void> {
+    try {
+        const rdfFile = await fs.readFile(pdfPath + '.rdf', 'utf-8');
+        await loadRDFStoreFromText(rdfFile);
+    } catch (error: any) {
+        if (error.code === 'ENOENT') {
+            console.log(`No existing RDF store found at ${pdfPath}.rdf`);
+            return;
+        }
+        throw new Error(`Failed to load RDF store: ${error.message}`);
+    }
+}
+
 async function main(): Promise<void> {
     try {
         const args = process.argv.slice(2);
         const pdfPath = args[0];
-        let question: string = "";
-
-        const questionIndex = args.indexOf('-q');
-        if (questionIndex !== -1 && args[questionIndex + 1]) {
-            question = args[questionIndex + 1];
-        }
-        if (!question) {
-            console.error('Please provide a question as argument');
-            process.exit(1);
-        }
 
         if (!pdfPath) {
             console.error('Please provide a PDF file path as argument');
             process.exit(1);
         }
 
+        // Check for indexing mode
+        if (args.includes('-i')) {
+            console.log('Indexing PDF:', pdfPath);
+            await indexPDF(pdfPath);
+            console.log('Indexing complete');
+            try {
+                await vectorStore.save(VECTOR_STORE_PATH);
+                await saveRDFStore(RDF_STORE_PATH);
+            } catch (error) {
+                console.error('Error saving vector store:', error);
+            }        
+            process.exit(0);
+        }
         
-        const pdfData = await extractPDFData(pdfPath);
-        console.log('PDF Processing Results:');
-        console.log(pdfData);
-        
-        const chunks = chunkPDF(pdfData.text);
-        
-        // Process 5 chunks in parallel
-        const analysis = await llm_do_initial_pass(chunks, question, 5);
-        const filteredAnalysis = analysis
-            .filter(chunk => chunk.save_for_later_processing)
-            .sort((a, b) => b.confidence - a.confidence);
-        console.log('\nGPT Analysis:', JSON.stringify(filteredAnalysis, null, 2));
+        // Check for querying mode
+        const questionIndex = args.indexOf('-q');
+        if (questionIndex !== -1 && args[questionIndex + 1]) {
+            await vectorStore.load(VECTOR_STORE_PATH);
+            await loadRDFStore(RDF_STORE_PATH);
+            await queryPDF(pdfPath, args[questionIndex + 1]);
+            process.exit(0);
+        }
 
-        // Add the question answering step
-        const answer = await llm_do_question_answer(filteredAnalysis, chunks, question, 5000);
-        console.log('\nAnswer:', answer);
-
-        const extractedChunkIndices = extractChunkIndices(answer);
-        console.log('\nExtracted Chunk Indices:', extractedChunkIndices);
-
-        // Get the referenced chunks from the original text
-        const referencedChunks = extractedChunkIndices.map(index => chunks[index]);
-        console.log('\nReferenced Chunks:');
-        referencedChunks.forEach((chunk, i) => {
-            console.log(`\nChunk ${extractedChunkIndices[i]}:`);
-            console.log(chunk);
-        });
-
-        process.exit(0);
+        console.error('Please specify either -i to index or -q "question" to query');
+        process.exit(1);
     } catch (error) {
         console.error('Error:', error);
         process.exit(1);
